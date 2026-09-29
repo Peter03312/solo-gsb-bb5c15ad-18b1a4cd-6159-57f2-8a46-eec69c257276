@@ -173,6 +173,103 @@ try {
     check('GET /api/health 返回服务名', data.ok === true && data.service === 'clause-reference-validator');
   }
 
+  // POST /api/validate：与页面 JSON 导入同规则；成功 / 失败响应结构不变
+  {
+    const article = (id: string, extra: Record<string, unknown> = {}): Record<string, unknown> => ({
+      id, kind: 'article', ordinal: 1, text: '', children: [], ...extra,
+    });
+    // 空 root 仍可导入
+    {
+      const res = await fetch(`http://127.0.0.1:${PORT}/api/validate`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ document: { id: 'd', title: '空文档', root: [] } }),
+      });
+      const data = await res.json();
+      check('validate 空 root 返回 200', res.status === 200 && data.ok === true &&
+        data.title === '空文档' && data.rootCount === 0, JSON.stringify(data));
+    }
+    // 合法条款树（条→款→项）
+    {
+      const doc = { title: '完整文档', root: [
+        { id: 'a1', kind: 'article', ordinal: 1, text: '条头', children: [
+          { id: 'p1', kind: 'paragraph', ordinal: 1, text: '款文', children: [
+            { id: 'i1', kind: 'item', ordinal: 1, text: '项文', children: [] },
+          ] },
+        ] },
+        article('a2'),
+      ] };
+      const res = await fetch(`http://127.0.0.1:${PORT}/api/validate`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ document: doc }),
+      });
+      const data = await res.json();
+      check('validate 合法树返回 200 与 rootCount', res.status === 200 &&
+        data.ok === true && data.rootCount === 2 && data.title === '完整文档', JSON.stringify(data));
+    }
+    // 缺 document.root（旧失败场景，响应结构保持 { error }）
+    {
+      const res = await fetch(`http://127.0.0.1:${PORT}/api/validate`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ document: { title: 'x' } }),
+      });
+      const data = await res.json();
+      check('validate 缺 root 返回 400 { error }',
+        res.status === 400 && typeof data.error === 'string' && data.error.includes('document.root'),
+        JSON.stringify(data));
+    }
+    // 两处条款共用节点 ID → 400 并说明重复 id
+    {
+      const res = await fetch(`http://127.0.0.1:${PORT}/api/validate`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ document: { title: 'x', root: [article('dup'), article('dup')] } }),
+      });
+      const data = await res.json();
+      check('validate 重复 ID 返回 400 并指出重复',
+        res.status === 400 && data.error.includes('id「dup」') && data.error.includes('重复'),
+        JSON.stringify(data));
+    }
+    // 子节点缺少 children → 400 并指出位置与缺失字段
+    {
+      const res = await fetch(`http://127.0.0.1:${PORT}/api/validate`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ document: { title: 'x', root: [{ id: 'a1', kind: 'article', text: '' }] } }),
+      });
+      const data = await res.json();
+      check('validate 缺 children 返回 400 并指出字段',
+        res.status === 400 && data.error.includes('children') && data.error.includes('第 1 个条'),
+        JSON.stringify(data));
+    }
+    // 层级错乱：条下直接挂项 → 400
+    {
+      const res = await fetch(`http://127.0.0.1:${PORT}/api/validate`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ document: { title: 'x', root: [
+          article('a1', { children: [{ id: 'i9', kind: 'item', ordinal: 1, text: '', children: [] }] }),
+        ] } }),
+      });
+      const data = await res.json();
+      check('validate 层级错乱返回 400', res.status === 400 &&
+        data.error.includes('paragraph'), JSON.stringify(data));
+    }
+    // validate 不写文件
+    {
+      await fetch(`http://127.0.0.1:${PORT}/api/validate`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ document: { title: '校验不应落盘', root: [] } }),
+      });
+      const res = await fetch(`http://127.0.0.1:${PORT}/api/state`);
+      const data = await res.json();
+      check('validate 不写状态文件', data.state === null || data.state.doc?.title !== '校验不应落盘');
+    }
+  }
+
   // 写入失败时保留原有完整文件，恢复后后续保存仍可继续
   {
     const good = stateWith('受保护版本', 99);

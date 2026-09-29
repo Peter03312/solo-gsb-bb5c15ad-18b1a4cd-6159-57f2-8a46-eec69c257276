@@ -4,7 +4,8 @@ import fs from 'node:fs';
 import fsp from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import type { ExportBundle, PersistedState } from '../shared/model';
+import type { PersistedState } from '../shared/model';
+import { validateImportBundle } from '../shared/importValidate';
 
 // ESM 运行（tsx 开发 / esbuild 打包均为 ESM）
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -101,12 +102,15 @@ app.put('/api/state', async (req, res) => {
 });
 
 app.post('/api/validate', (req, res) => {
-  const bundle = req.body as ExportBundle;
-  if (!bundle || !bundle.document || !Array.isArray(bundle.document.root)) {
-    res.status(400).json({ error: '导入文件缺少 document.root' });
+  // 与页面「选择 JSON 文件」导入完全一致的校验规则（条→款→项层级、
+  // 必需字段、全树节点 ID 唯一；空 root 数组合法）。成功 / 失败响应结构保持原样。
+  const result = validateImportBundle(req.body);
+  if (!result.ok) {
+    res.status(400).json({ error: result.reason });
     return;
   }
-  res.json({ ok: true, title: bundle.document.title, rootCount: bundle.document.root.length });
+  const doc = result.document;
+  res.json({ ok: true, title: doc.title, rootCount: doc.root.length });
 });
 
 // 生产模式托管前端构建产物（dist-server/index.cjs → 同级 ../dist）

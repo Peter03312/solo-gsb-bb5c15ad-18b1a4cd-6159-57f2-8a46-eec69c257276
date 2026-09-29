@@ -1,6 +1,5 @@
 import { useRef, useState } from 'react';
 import { useApp } from '../lib/context';
-import type { ExportBundle } from '../../shared/model';
 import { sampleDocument } from '../lib/sample';
 
 const PASTE_PLACEHOLDER = `示例法（节选）
@@ -34,17 +33,23 @@ export function ImportDialog({ onClose }: { onClose: () => void }) {
 
   const onFile = async (file: File) => {
     setError(null);
+    let parsed: unknown;
     try {
-      const parsed = JSON.parse(await file.text()) as ExportBundle;
-      if (!parsed.document || !Array.isArray(parsed.document.root)) {
-        setError('JSON 结构不合法：缺少 document.root');
-        return;
-      }
-      store.importJson(parsed);
-      onClose();
+      parsed = JSON.parse(await file.text());
     } catch (e) {
       setError(`JSON 解析失败：${(e as Error).message}`);
+      return;
     }
+    // 与 POST /api/validate 同一套校验（条→款→项、必需字段、全树 ID 唯一）；
+    // 失败时 store 保证当前正文、审阅留痕与撤销历史原样不变，仅展示原因
+    const result = store.importJson(parsed);
+    if (!result.ok) {
+      setError(`导入文件不合法，当前文档未改动：${result.error}`);
+      // 允许修正文件后重新选择同一个文件
+      if (fileRef.current) fileRef.current.value = '';
+      return;
+    }
+    onClose();
   };
 
   return (

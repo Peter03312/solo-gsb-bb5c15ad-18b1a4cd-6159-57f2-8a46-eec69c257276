@@ -63,6 +63,7 @@ import {
   scanTerms,
 } from './terminology';
 import type { TermHit, TermRule } from '../../shared/model';
+import { validateImportBundle } from '../../shared/importValidate';
 import { sampleTermRules } from './sample';
 import { uid } from './uid';
 
@@ -589,33 +590,44 @@ export class AppStore {
     );
   }
 
-  importJson(bundle: ExportBundle | PersistedState): void {
-    const rawDoc = 'document' in bundle ? bundle.document : bundle.doc;
+  /**
+   * 整份导入 JSON 导出包（{ document, ... }）或持久化状态（{ doc, ... }）。
+   * 先按与 POST /api/validate 一致的规则（条→款→项层级、必需字段、全树 ID 唯一）
+   * 校验文档：任一不合格时原样返回失败原因，绝不触碰当前正文、审阅留痕与撤销历史；
+   * 合法包保留全部节点 ID，附属记录（确认 / 快照 / 批注 / 规则 / 基线 / 审签 / 例外）
+   * 随包恢复，故引用定位与审签在导入后仍关联原节点。
+   */
+  importJson(bundle: unknown): { ok: true } | { ok: false; error: string } {
+    const validation = validateImportBundle(bundle);
+    if (!validation.ok) return { ok: false, error: validation.reason };
+    const rawDoc = validation.document;
+    const source = bundle as Partial<ExportBundle> & Partial<PersistedState>;
     const doc: ClauseDocument = {
       id: rawDoc.id || uid('doc'),
       title: typeof rawDoc.title === 'string' ? rawDoc.title : '未命名条款集',
-      root: Array.isArray(rawDoc.root) ? rawDoc.root : [],
+      root: rawDoc.root,
       updatedAt: Date.now(),
     };
-    const confirmed = bundle.confirmed ?? {};
+    const confirmed = source.confirmed ?? {};
     // 快照随 JSON 导入；旧文件缺少 snapshots 时按空列表加载
-    const snapshots = sanitizeSnapshots(bundle.snapshots);
+    const snapshots = sanitizeSnapshots(source.snapshots);
     // 问题基线随 JSON 导入（重新分析重建问题身份）；旧文件缺少 issueBaselines 时按空列表加载
-    const issueBaselines = sanitizeIssueBaselines(bundle.issueBaselines);
+    const issueBaselines = sanitizeIssueBaselines(source.issueBaselines);
     // 批注随 JSON 导入并按导入后的正文重定位；旧文件缺少 annotations 时为空
-    const annotations = sanitizeAnnotations(bundle.annotations);
+    const annotations = sanitizeAnnotations(source.annotations);
     // 规范用语规则随 JSON 导入；旧文件缺少 termRules 时按空规则加载
-    const termRules = sanitizeTermRules(bundle.termRules);
+    const termRules = sanitizeTermRules(source.termRules);
     // 审签记录随 JSON 导入；旧文件缺少 signoffs 时按空列表加载，有效 / 待重签按导入正文实时重算
-    const signoffs = sanitizeSignoffs(bundle.signoffs);
+    const signoffs = sanitizeSignoffs(source.signoffs);
     // 例外处置记录随 JSON 导入；旧文件缺少 issueExceptions 时按空列表加载，三态按导入正文实时重算
-    const issueExceptions = sanitizeIssueExceptions(bundle.issueExceptions);
+    const issueExceptions = sanitizeIssueExceptions(source.issueExceptions);
     renumberAll(doc.root);
     // 导入包的整套状态作为新世界事务：撤销恢复导入前文档及其留痕，重做恢复导入后整套状态
     this.commitReplacement(
       { doc: touch(doc), confirmed, annotations, termRules },
       { snapshots, issueBaselines, signoffs, issueExceptions },
     );
+    return { ok: true };
   }
 
   exportJson(): ExportBundle {

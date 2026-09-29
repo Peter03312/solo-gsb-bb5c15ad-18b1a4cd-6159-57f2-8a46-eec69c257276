@@ -55,6 +55,7 @@ import {
 import { findReferencePath } from '../src/lib/pathfind';
 import { boundaryOffset, linearText, type SeqNodeAdapter } from '../src/lib/selection';
 import { sampleDocument } from '../src/lib/sample';
+import { validateImportBundle, validateClauseDocument } from '../shared/importValidate';
 let pass = 0;
 let fail = 0;
 function check(name: string, cond: boolean, extra = '') {
@@ -2817,6 +2818,160 @@ check('闭区间为每个目标建边', combA.edges.filter((e) => e.refKey === r
       rs.signoffView.counts.valid === 1 && rs.canUndo === false);
     delete (globalThis as { localStorage?: Storage }).localStorage;
   }
+}
+
+// ---- JSON 导入校验：条→款→项层级、必需字段、全树 ID 唯一；与 /api/validate 同规则 ----
+{
+  const n = (id: string, kind: 'article' | 'paragraph' | 'item', children: unknown[] = []): unknown => ({
+    id, kind, ordinal: 1, text: '', children,
+  });
+  const expectInvalid = (input: unknown, phrase: string, label: string): void => {
+    const r = validateImportBundle(input);
+    check(label, !r.ok && (r.ok ? false : r.reason.includes(phrase)), r.ok ? '(unexpected ok)' : r.reason);
+  };
+  const validDoc = {
+    id: 'd', title: '校验法', root: [
+      { id: 'a1', kind: 'article', ordinal: 1, text: '条头', children: [
+        { id: 'p1', kind: 'paragraph', ordinal: 1, text: '款文', children: [
+          { id: 'i1', kind: 'item', ordinal: 1, text: '项文', children: [] },
+        ] },
+      ] },
+    ],
+  };
+
+  check('合法文档校验通过', validateImportBundle({ document: validDoc }).ok === true);
+  check('持久化形态 { doc } 同样通过', validateImportBundle({ doc: validDoc, confirmed: {} }).ok === true);
+  check('空 root 合法（空文档可导入）',
+    validateImportBundle({ document: { id: 'd2', title: '空', root: [] } }).ok === true);
+  check('节点 text 允许空串、ordinal 可缺省',
+    validateClauseDocument({ id: 'd3', root: [n('a9', 'article')] }).ok === true);
+  check('校验不修改入参', (() => {
+    const doc = JSON.parse(JSON.stringify(validDoc)) as typeof validDoc;
+    validateImportBundle({ document: doc });
+    return doc.root[0].ordinal === 1;
+  })());
+
+  expectInvalid(null, 'JSON 对象', '非对象被拒');
+  expectInvalid({}, '缺少 document', '缺 document 被拒');
+  expectInvalid({ document: { title: 'x' } }, 'document.root', '缺 root 被拒');
+  check('root 为 null 被拒并说明原因',
+    validateClauseDocument({ root: null }).ok === false);
+  expectInvalid({ document: { root: [null] } }, '节点必须是对象', 'null 节点被拒');
+  expectInvalid({ document: { root: [n('')] } }, '必需字段 id', '空 id 被拒');
+  expectInvalid({ document: { root: [{ kind: 'article', text: '', children: [] }] } }, '必需字段 id', '缺 id 被拒');
+  expectInvalid({ document: { root: [{ id: 'a', kind: 'paragraph', text: '', children: [] }] } },
+    '类型必须为「article」', '顶层款被拒');
+  expectInvalid({ document: { root: [{ id: 'a', kind: 'article', text: '', children: [n('x', 'item')] }] } },
+    '类型必须为「paragraph」', '条下直接挂项被拒');
+  expectInvalid({ document: { root: [n('a', 'article', [n('p', 'paragraph', [n('i', 'item', [n('x', 'item')])])])] } },
+    '项之下不允许', '项再有子节点被拒');
+  expectInvalid({ document: { root: [{ id: 'a', kind: 'article', children: [] }] } }, '必需字段 text', '缺 text 被拒');
+  expectInvalid({ document: { root: [{ id: 'a', kind: 'article', text: '' }] } }, '必需字段 children', '缺 children 被拒');
+  expectInvalid({ document: { root: [{ id: 'a', kind: 'article', text: '', children: null }] } },
+    '必需字段 children', 'children 为 null 被拒');
+  expectInvalid({ document: { root: [{ id: 'a', kind: 'article', text: 1, children: [] }] } },
+    '必需字段 text', 'text 非字符串被拒');
+  expectInvalid({ document: { root: [{ id: 'a', kind: 'item', text: '', children: [] }] } },
+    '类型必须为「article」', 'kind 非法值被拒');
+  expectInvalid({ document: { root: [{ id: 'a', kind: 'article', text: '', children: [], ordinal: '一' }] } },
+    'ordinal 必须是有限数字', 'ordinal 类型错误被拒');
+  // 全树 ID 唯一：两处条款共用同一 id（即便在不同层级）必须报错并给出位置与重复 id
+  {
+    const dup = { document: { root: [
+      { id: 'dup', kind: 'article', ordinal: 1, text: '', children: [
+        { id: 'p1', kind: 'paragraph', ordinal: 1, text: '', children: [
+          { id: 'dup', kind: 'item', ordinal: 1, text: '', children: [] },
+        ] },
+      ] },
+    ] } };
+    const r = validateImportBundle(dup);
+    check('跨层级重复 id 被拒并指出重复值',
+      !r.ok && (r.ok ? false : r.reason.includes('id「dup」') && r.reason.includes('重复')),
+      r.ok ? '' : r.reason);
+  }
+  {
+    const dup = { document: { root: [
+      { id: 'same', kind: 'article', ordinal: 1, text: '', children: [] },
+      { id: 'same', kind: 'article', ordinal: 2, text: '', children: [] },
+    ] } };
+    const r = validateImportBundle(dup);
+    check('两条共用 id 被拒',
+      !r.ok && (r.ok ? false : r.reason.includes('id「same」')));
+  }
+  {
+    // 失败原因须带结构位置，便于定位
+    const r = validateImportBundle({ document: { root: [
+      n('a1', 'article', [n('p1', 'paragraph', [{ id: 'i1', kind: 'paragraph', text: '', children: [] }])]),
+    ] } });
+    check('失败原因包含结构位置（第几个条/款）',
+      !r.ok && (r.ok ? false : r.reason.includes('第 1 个条') && r.reason.includes('第 1 个款')),
+      r.ok ? '' : r.reason);
+  }
+}
+
+// ---- JSON 导入：合法包保留节点 ID 与附属记录，引用与审签仍关联原节点 ----
+{
+  const d = parseDocument(`关联法
+
+第一条
+参见第二条。
+
+第二条
+目标条。`).doc;
+  renumberAll(d.root);
+  const src = new AppStore({ doc: d, confirmed: {}, annotations: [] });
+  const firstId = d.root[0].id;
+  check('导入前：审签第一条有效', src.signArticle(firstId, '原签人').ok === true &&
+    src.getSignoffView().counts.valid === 1);
+  const bundle = src.exportJson();
+
+  const dst = new AppStore({ doc: parseDocument('另一文档\n\n第一条\n无关。').doc, confirmed: {}, annotations: [] });
+  const res = dst.importJson(bundle);
+  check('合法导出包导入成功', res.ok === true);
+  const s = dst.getSnapshot();
+  check('导入保留全部节点 ID', s.doc.root[0].id === firstId &&
+    s.doc.root[1].id === d.root[1].id);
+  check('导入后引用仍解析到原节点', s.analysis.occurrences.find((o) => o.span.raw === '第二条')
+    ?.resolution.targetId === d.root[1].id);
+  check('导入后审签仍关联原节点且有效', s.signoffView.counts.valid === 1 &&
+    s.signoffView.entries[0].articleId === firstId &&
+    s.signoffView.entries[0].signoff?.signer === '原签人');
+
+  // 非法包：当前正文、审阅留痕与撤销历史保持原状
+  const beforeTitle = s.doc.title;
+  // 此前成功导入已压入一帧：记录其撤销 / 重做边界，验证失败导入不新增帧
+  dst.undo();
+  const preImportRootLen = dst.getSnapshot().doc.root.length; // 导入前的初始文档
+  dst.redo();
+  check('测试前置：回到成功导入后的两条款状态', dst.getSnapshot().doc.root.length === 2);
+
+  const badDup = JSON.parse(JSON.stringify(bundle)) as typeof bundle;
+  (badDup.document.root[1] as { id: string }).id = badDup.document.root[0].id;
+  const failDup = dst.importJson(badDup);
+  check('重复 ID：导入被拒并说明原因', !failDup.ok && failDup.error.includes('重复'));
+  check('重复 ID：正文未改动', dst.getSnapshot().doc.title === beforeTitle &&
+    dst.getSnapshot().doc.root.length === 2);
+  check('重复 ID：审签留痕未改动', dst.getSignoffView().counts.valid === 1);
+  dst.undo();
+  check('重复 ID：撤销历史未新增帧（撤销仍回到导入前初始文档）',
+    dst.getSnapshot().doc.root.length === preImportRootLen);
+  dst.redo();
+  check('重复 ID：重做恢复成功导入的文档（失败导入无残留）',
+    dst.getSnapshot().doc.root.length === 2 && dst.getSignoffView().counts.valid === 1);
+
+  const badChildren = JSON.parse(JSON.stringify(bundle)) as typeof bundle;
+  delete (badChildren.document.root[0] as Partial<typeof badChildren.document.root[number]>).children;
+  const failChild = dst.importJson(badChildren);
+  check('缺 children：导入被拒且不抛错', !failChild.ok && failChild.error.includes('children'));
+  check('缺 children：正文与留痕保持原状', dst.getSnapshot().doc.root.length === 2 &&
+    dst.getSignoffView().counts.valid === 1);
+
+  // 空 root 仍可导入；导入事务可撤销恢复
+  const emptyRes = dst.importJson({ document: { id: 'empty', title: '空文档', root: [] }, confirmed: {} });
+  check('空 root 可以导入', emptyRes.ok === true && dst.getSnapshot().doc.root.length === 0);
+  dst.undo();
+  check('撤销空文档导入恢复原节点 ID 与审签', dst.getSnapshot().doc.root[0].id === firstId &&
+    dst.getSignoffView().counts.valid === 1);
 }
 
 console.log(`\n通过 ${pass} 项，失败 ${fail} 项`);
